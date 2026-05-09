@@ -1,128 +1,166 @@
-import os
 import json
+import os
+
 import requests
-from http.server import BaseHTTPRequestHandler
-from nacl.signing import VerifyKey
+from fastapi import FastAPI, Header, HTTPException, Request
 from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
+
+app = FastAPI()
 
 DISCORD_PUBLIC_KEY = os.getenv("DISCORD_PUBLIC_KEY")
 TAIGA_API = os.getenv("TAIGA_API")
 TAIGA_USERNAME = os.getenv("TAIGA_USERNAME")
 TAIGA_PASSWORD = os.getenv("TAIGA_PASSWORD")
-TAIGA_PROJECT_ID = int(os.getenv("TAIGA_PROJECT_ID"))
+
+_taiga_project_raw = os.getenv("TAIGA_PROJECT_ID")
+TAIGA_PROJECT_ID = int(_taiga_project_raw) if _taiga_project_raw and _taiga_project_raw.isdigit() else None
+
+
+def _ensure_taiga_config():
+    if not all([TAIGA_API, TAIGA_USERNAME, TAIGA_PASSWORD]) or TAIGA_PROJECT_ID is None:
+        raise RuntimeError("Missing Taiga configuration in environment variables")
+
 
 # ---------- TAIGA AUTH ----------
 def get_taiga_token():
-    res = requests.post(f"{TAIGA_API}/auth", json={
-        "type": "normal",
-        "username": TAIGA_USERNAME,
-        "password": TAIGA_PASSWORD
-    })
+    _ensure_taiga_config()
+    res = requests.post(
+        f"{TAIGA_API}/auth",
+        json={
+            "type": "normal",
+            "username": TAIGA_USERNAME,
+            "password": TAIGA_PASSWORD,
+        },
+        timeout=20,
+    )
+    if not res.ok:
+        raise RuntimeError(f"Taiga auth failed: {res.status_code}")
     return res.json()["auth_token"]
+
 
 def taiga_post(endpoint, data):
     token = get_taiga_token()
-    res = requests.post(
+    return requests.post(
         f"{TAIGA_API}/{endpoint}",
         headers={"Authorization": f"Bearer {token}"},
-        json=data
+        json=data,
+        timeout=20,
     )
-    return res
+
 
 # ---------- COMMAND HANDLERS ----------
 def create_task(name):
-    res = taiga_post("tasks", {
-        "subject": name,
-        "project": TAIGA_PROJECT_ID,
-        "status": 1
-    })
+    res = taiga_post(
+        "tasks",
+        {
+            "subject": name,
+            "project": TAIGA_PROJECT_ID,
+            "status": 1,
+        },
+    )
     return "✅ Task created" if res.status_code == 201 else "❌ Failed"
 
+
 def create_story(name):
-    res = taiga_post("userstories", {
-        "subject": name,
-        "project": TAIGA_PROJECT_ID,
-        "status": 1
-    })
+    res = taiga_post(
+        "userstories",
+        {
+            "subject": name,
+            "project": TAIGA_PROJECT_ID,
+            "status": 1,
+        },
+    )
     return "📚 Story created" if res.status_code == 201 else "❌ Failed"
 
+
 def create_issue(name):
-    res = taiga_post("issues", {
-        "subject": name,
-        "project": TAIGA_PROJECT_ID,
-        "status": 1,
-        "priority": 2
-    })
+    res = taiga_post(
+        "issues",
+        {
+            "subject": name,
+            "project": TAIGA_PROJECT_ID,
+            "status": 1,
+            "priority": 2,
+        },
+    )
     return "🐞 Issue created" if res.status_code == 201 else "❌ Failed"
 
+
 def comment(task_id, text):
-    res = taiga_post(f"history/task/{task_id}", {
-        "comment": text
-    })
+    res = taiga_post(
+        f"history/task/{task_id}",
+        {
+            "comment": text,
+        },
+    )
     return "💬 Comment added" if res.status_code == 201 else "❌ Failed"
 
-# ---------- DISCORD HANDLER ----------
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        try:
-            length = int(self.headers['Content-Length'])
-            body = self.rfile.read(length)
-            signature = self.headers.get("X-Signature-Ed25519")
-            timestamp = self.headers.get("X-Signature-Timestamp")
 
-            verify_key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
+def _verify_discord_signature(body, signature, timestamp):
+    if not DISCORD_PUBLIC_KEY:
+        raise HTTPException(status_code=500, detail="Missing DISCORD_PUBLIC_KEY")
+    if not signature or not timestamp:
+        raise HTTPException(status_code=401, detail="Missing Discord signature headers")
 
-            try:
-                verify_key.verify(timestamp.encode() + body, bytes.fromhex(signature))
-            except BadSignatureError:
-                self.send_response(401)
-                self.end_headers()
-                return
+    try:
+        verify_key = VerifyKey(bytes.fromhex(DISCORD_PUBLIC_KEY))
+        verify_key.verify(timestamp.encode() + body, bytes.fromhex(signature))
+    except (BadSignatureError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid request signature")
 
-            data = json.loads(body)
 
-            # Ping (Discord verification)
-            if data["type"] == 1:
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(json.dumps({"type": 1}).encode())
-                return
+@app.get("/")
+def root_health():
+    return {"status": "ok", "message": "Use POST for Discord interactions"}
 
-            # Slash command
-            if data["type"] == 2:
-                name = data["data"]["name"]
-                options = data["data"].get("options", [])
 
-                if name == "create-task":
-                    task_name = options[0]["value"]
-                    msg = create_task(task_name)
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
-                elif name == "create-story":
-                    msg = create_story(options[0]["value"])
 
-                elif name == "create-issue":
-                    msg = create_issue(options[0]["value"])
+@app.post("/")
+async def discord_interactions(
+    request: Request,
+    x_signature_ed25519: str = Header(default=None),
+    x_signature_timestamp: str = Header(default=None),
+):
+    body = await request.body()
+    _verify_discord_signature(body, x_signature_ed25519, x_signature_timestamp)
 
-                elif name == "comment":
-                    task_id = options[0]["value"]
-                    text = options[1]["value"]
-                    msg = comment(task_id, text)
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-                else:
-                    msg = "Unknown command"
+    if data.get("type") == 1:
+        return {"type": 1}
 
-                response = {
-                    "type": 4,
-                    "data": {
-                        "content": msg
-                    }
-                }
+    if data.get("type") != 2:
+        raise HTTPException(status_code=400, detail="Unsupported interaction type")
 
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(json.dumps(response).encode())
+    command_data = data.get("data", {})
+    name = command_data.get("name")
+    options = command_data.get("options", [])
 
-        except Exception as e:
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(str(e).encode())
+    try:
+        if name == "create-task":
+            msg = create_task(options[0]["value"])
+        elif name == "create-story":
+            msg = create_story(options[0]["value"])
+        elif name == "create-issue":
+            msg = create_issue(options[0]["value"])
+        elif name == "comment":
+            msg = comment(options[0]["value"], options[1]["value"])
+        else:
+            msg = "Unknown command"
+    except (IndexError, KeyError, TypeError):
+        msg = "Invalid command options"
+
+    return {
+        "type": 4,
+        "data": {
+            "content": msg,
+        },
+    }
